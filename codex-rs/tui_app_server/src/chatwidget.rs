@@ -37,6 +37,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
+use url::Url;
+
 use self::realtime::PendingSteerCompareKey;
 use crate::app_command::AppCommand;
 use crate::app_event::RealtimeAudioDeviceKind;
@@ -85,8 +87,6 @@ use codex_core::config::types::ApprovalsReviewer;
 use codex_core::config::types::Notifications;
 use codex_core::config::types::WindowsSandboxModeToml;
 use codex_core::config_loader::ConfigLayerStackOrdering;
-use codex_core::features::FEATURES;
-use codex_core::features::Feature;
 use codex_core::find_thread_name_by_id;
 use codex_core::git_info::current_branch_name;
 use codex_core::git_info::get_git_repo_root;
@@ -94,10 +94,10 @@ use codex_core::git_info::local_git_branches;
 use codex_core::plugins::PluginsManager;
 use codex_core::project_doc::DEFAULT_PROJECT_DOC_FILENAME;
 use codex_core::skills::model::SkillMetadata;
-use codex_core::terminal::TerminalName;
-use codex_core::terminal::terminal_info;
 #[cfg(target_os = "windows")]
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
+use codex_features::FEATURES;
+use codex_features::Feature;
 use codex_otel::RuntimeMetricsSummary;
 use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
@@ -199,6 +199,10 @@ use codex_protocol::request_user_input::RequestUserInputEvent;
 use codex_protocol::request_user_input::RequestUserInputQuestionOption;
 use codex_protocol::user_input::TextElement;
 use codex_protocol::user_input::UserInput;
+use codex_terminal_detection::Multiplexer;
+use codex_terminal_detection::TerminalInfo;
+use codex_terminal_detection::TerminalName;
+use codex_terminal_detection::terminal_info;
 use codex_utils_sleep_inhibitor::SleepInhibitor;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -236,14 +240,21 @@ const APP_SERVER_TUI_STUB_MESSAGE: &str = "Not available in app-server TUI yet."
 /// Choose the keybinding used to edit the most-recently queued message.
 ///
 /// Apple Terminal, Warp, and VSCode integrated terminals intercept or silently
-/// swallow Alt+Up, so users in those environments would never be able to trigger
-/// the edit action.  We fall back to Shift+Left for those terminals while
-/// keeping the more discoverable Alt+Up everywhere else.
+/// swallow Alt+Up, and tmux does not reliably pass that chord through. We fall
+/// back to Shift+Left for those environments while keeping the more discoverable
+/// Alt+Up everywhere else.
 ///
 /// The match is exhaustive so that adding a new `TerminalName` variant forces
 /// an explicit decision about which binding that terminal should use.
-fn queued_message_edit_binding_for_terminal(terminal_name: TerminalName) -> KeyBinding {
-    match terminal_name {
+fn queued_message_edit_binding_for_terminal(terminal_info: TerminalInfo) -> KeyBinding {
+    if matches!(
+        terminal_info.multiplexer.as_ref(),
+        Some(Multiplexer::Tmux { .. })
+    ) {
+        return key_hint::shift(KeyCode::Left);
+    }
+
+    match terminal_info.name {
         TerminalName::AppleTerminal | TerminalName::WarpTerminal | TerminalName::VsCode => {
             key_hint::shift(KeyCode::Left)
         }
@@ -327,6 +338,8 @@ mod skills;
 use self::skills::collect_tool_mentions;
 use self::skills::find_app_mentions;
 use self::skills::find_skill_mentions_with_tool_mentions;
+mod plugins;
+use self::plugins::PluginsCacheState;
 mod realtime;
 use self::realtime::RealtimeConversationUiState;
 use self::realtime::RenderedUserMessageEvent;
@@ -547,6 +560,12 @@ enum ConnectorsCacheState {
     Failed(String),
 }
 
+#[derive(Debug, Clone, Default)]
+struct PluginListFetchState {
+    cache_cwd: Option<PathBuf>,
+    in_flight_cwd: Option<PathBuf>,
+}
+
 #[derive(Debug)]
 enum RateLimitErrorKind {
     ServerOverloaded,
@@ -751,6 +770,8 @@ pub(crate) struct ChatWidget {
     connectors_partial_snapshot: Option<ConnectorsSnapshot>,
     connectors_prefetch_in_flight: bool,
     connectors_force_refetch_pending: bool,
+    plugins_cache: PluginsCacheState,
+    plugins_fetch_state: PluginListFetchState,
     // Queue of interruptive UI events deferred during an active write cycle
     interrupts: InterruptManager,
     // Accumulates the current reasoning block text to extract a header
@@ -1779,6 +1800,7 @@ impl ChatWidget {
         self.refresh_model_display();
         self.sync_fast_command_enabled();
         self.sync_personality_command_enabled();
+        self.sync_plugins_command_enabled();
         self.refresh_plugin_mentions();
         let startup_tooltip_override = self.startup_tooltip_override.take();
         let show_fast_status = self.should_show_fast_status(&model_for_header, event.service_tier);
@@ -3133,15 +3155,15 @@ impl ChatWidget {
 
     fn on_image_generation_end(&mut self, event: ImageGenerationEndEvent) {
         self.flush_answer_stream_with_separator();
-        let saved_to = event.saved_path.as_deref().and_then(|saved_path| {
-            std::path::Path::new(saved_path)
-                .parent()
-                .map(|parent| parent.display().to_string())
+        let saved_path = event.saved_path.map(|saved_path| {
+            Url::from_file_path(Path::new(&saved_path))
+                .map(|url| url.to_string())
+                .unwrap_or(saved_path)
         });
         self.add_to_history(history_cell::new_image_generation_call(
             event.call_id,
             event.revised_prompt,
-            saved_to,
+            saved_path,
         ));
         self.request_redraw();
     }
@@ -4157,8 +4179,7 @@ impl ChatWidget {
         let active_cell = Some(Self::placeholder_session_header_cell(&config));
 
         let current_cwd = Some(config.cwd.clone());
-        let queued_message_edit_binding =
-            queued_message_edit_binding_for_terminal(terminal_info().name);
+        let queued_message_edit_binding = queued_message_edit_binding_for_terminal(terminal_info());
         let mut widget = Self {
             app_event_tx: app_event_tx.clone(),
             frame_requester: frame_requester.clone(),
@@ -4209,6 +4230,8 @@ impl ChatWidget {
             connectors_partial_snapshot: None,
             connectors_prefetch_in_flight: false,
             connectors_force_refetch_pending: false,
+            plugins_cache: PluginsCacheState::default(),
+            plugins_fetch_state: PluginListFetchState::default(),
             interrupts: InterruptManager::new(),
             reasoning_buffer: String::new(),
             full_reasoning_buffer: String::new(),
@@ -4276,6 +4299,7 @@ impl ChatWidget {
             .set_collaboration_modes_enabled(/*enabled*/ true);
         widget.sync_fast_command_enabled();
         widget.sync_personality_command_enabled();
+        widget.sync_plugins_command_enabled();
         widget
             .bottom_pane
             .set_queued_message_edit_binding(widget.queued_message_edit_binding);
@@ -4697,7 +4721,7 @@ impl ChatWidget {
 
                     self.session_telemetry.counter(
                         "codex.windows_sandbox.setup_elevated_sandbox_command",
-                        1,
+                        /*inc*/ 1,
                         &[],
                     );
                     self.app_event_tx
@@ -4812,6 +4836,9 @@ impl ChatWidget {
             }
             SlashCommand::Apps => {
                 self.add_connectors_output();
+            }
+            SlashCommand::Plugins => {
+                self.add_plugins_output();
             }
             SlashCommand::Rollout => {
                 if let Some(path) = self.rollout_path() {
@@ -5708,13 +5735,14 @@ impl ChatWidget {
                 status,
                 revised_prompt,
                 result,
+                saved_path,
             } => {
                 self.on_image_generation_end(ImageGenerationEndEvent {
                     call_id: id,
                     result,
                     revised_prompt,
                     status,
-                    saved_path: None,
+                    saved_path,
                 });
             }
             ThreadItem::EnteredReviewMode { review, .. } => {
@@ -5733,6 +5761,7 @@ impl ChatWidget {
             ThreadItem::ContextCompaction { .. } => {
                 self.on_agent_message("Context compacted".to_owned());
             }
+            ThreadItem::HookPrompt { .. } => {}
             ThreadItem::CollabAgentToolCall {
                 id,
                 tool,
@@ -6044,11 +6073,13 @@ impl ChatWidget {
             | ServerNotification::RawResponseItemCompleted(_)
             | ServerNotification::CommandExecOutputDelta(_)
             | ServerNotification::McpToolCallProgress(_)
+            | ServerNotification::McpServerStatusUpdated(_)
             | ServerNotification::McpServerOauthLoginCompleted(_)
             | ServerNotification::AppListUpdated(_)
             | ServerNotification::ContextCompacted(_)
             | ServerNotification::FuzzyFileSearchSessionUpdated(_)
             | ServerNotification::FuzzyFileSearchSessionCompleted(_)
+            | ServerNotification::ThreadRealtimeTranscriptUpdated(_)
             | ServerNotification::WindowsWorldWritableWarning(_)
             | ServerNotification::WindowsSandboxSetupCompleted(_)
             | ServerNotification::AccountLoginCompleted(_) => {}
@@ -8703,8 +8734,11 @@ impl ChatWidget {
             return;
         }
 
-        self.session_telemetry
-            .counter("codex.windows_sandbox.elevated_prompt_shown", 1, &[]);
+        self.session_telemetry.counter(
+            "codex.windows_sandbox.elevated_prompt_shown",
+            /*inc*/ 1,
+            &[],
+        );
 
         let mut header = ColumnRenderable::new();
         header.push(*Box::new(
@@ -8723,7 +8757,11 @@ impl ChatWidget {
                 name: "Set up default sandbox (requires Administrator permissions)".to_string(),
                 description: None,
                 actions: vec![Box::new(move |tx| {
-                    accept_otel.counter("codex.windows_sandbox.elevated_prompt_accept", 1, &[]);
+                    accept_otel.counter(
+                        "codex.windows_sandbox.elevated_prompt_accept",
+                        /*inc*/ 1,
+                        &[],
+                    );
                     tx.send(AppEvent::BeginWindowsSandboxElevatedSetup {
                         preset: preset.clone(),
                     });
@@ -8735,7 +8773,11 @@ impl ChatWidget {
                 name: "Use non-admin sandbox (higher risk if prompt injected)".to_string(),
                 description: None,
                 actions: vec![Box::new(move |tx| {
-                    legacy_otel.counter("codex.windows_sandbox.elevated_prompt_use_legacy", 1, &[]);
+                    legacy_otel.counter(
+                        "codex.windows_sandbox.elevated_prompt_use_legacy",
+                        /*inc*/ 1,
+                        &[],
+                    );
                     tx.send(AppEvent::BeginWindowsSandboxLegacySetup {
                         preset: legacy_preset.clone(),
                     });
@@ -8747,7 +8789,11 @@ impl ChatWidget {
                 name: "Quit".to_string(),
                 description: None,
                 actions: vec![Box::new(move |tx| {
-                    quit_otel.counter("codex.windows_sandbox.elevated_prompt_quit", 1, &[]);
+                    quit_otel.counter(
+                        "codex.windows_sandbox.elevated_prompt_quit",
+                        /*inc*/ 1,
+                        &[],
+                    );
                     tx.send(AppEvent::Exit(ExitMode::ShutdownFirst));
                 })],
                 dismiss_on_select: true,
@@ -8797,7 +8843,11 @@ impl ChatWidget {
                     let otel = self.session_telemetry.clone();
                     let preset = elevated_preset;
                     move |tx| {
-                        otel.counter("codex.windows_sandbox.fallback_retry_elevated", 1, &[]);
+                        otel.counter(
+                            "codex.windows_sandbox.fallback_retry_elevated",
+                            /*inc*/ 1,
+                            &[],
+                        );
                         tx.send(AppEvent::BeginWindowsSandboxElevatedSetup {
                             preset: preset.clone(),
                         });
@@ -8813,7 +8863,11 @@ impl ChatWidget {
                     let otel = self.session_telemetry.clone();
                     let preset = legacy_preset;
                     move |tx| {
-                        otel.counter("codex.windows_sandbox.fallback_use_legacy", 1, &[]);
+                        otel.counter(
+                            "codex.windows_sandbox.fallback_use_legacy",
+                            /*inc*/ 1,
+                            &[],
+                        );
                         tx.send(AppEvent::BeginWindowsSandboxLegacySetup {
                             preset: preset.clone(),
                         });
@@ -8826,7 +8880,11 @@ impl ChatWidget {
                 name: "Quit".to_string(),
                 description: None,
                 actions: vec![Box::new(move |tx| {
-                    quit_otel.counter("codex.windows_sandbox.fallback_prompt_quit", 1, &[]);
+                    quit_otel.counter(
+                        "codex.windows_sandbox.fallback_prompt_quit",
+                        /*inc*/ 1,
+                        &[],
+                    );
                     tx.send(AppEvent::Exit(ExitMode::ShutdownFirst));
                 })],
                 dismiss_on_select: true,
@@ -8866,11 +8924,12 @@ impl ChatWidget {
         // While elevated sandbox setup runs, prevent typing so the user doesn't
         // accidentally queue messages that will run under an unexpected mode.
         self.bottom_pane.set_composer_input_enabled(
-            false,
+            /*enabled*/ false,
             Some("Input disabled until setup completes.".to_string()),
         );
         self.bottom_pane.ensure_status_indicator();
-        self.bottom_pane.set_interrupt_hint_visible(false);
+        self.bottom_pane
+            .set_interrupt_hint_visible(/*visible*/ false);
         self.set_status(
             "Setting up sandbox...".to_string(),
             Some("Hang tight, this may take a few minutes".to_string()),
@@ -8886,7 +8945,8 @@ impl ChatWidget {
 
     #[cfg(target_os = "windows")]
     pub(crate) fn clear_windows_sandbox_setup_status(&mut self) {
-        self.bottom_pane.set_composer_input_enabled(true, None);
+        self.bottom_pane
+            .set_composer_input_enabled(/*enabled*/ true, /*placeholder*/ None);
         self.bottom_pane.hide_status_indicator();
         self.request_redraw();
     }
@@ -8953,6 +9013,7 @@ impl ChatWidget {
             self.sync_personality_command_enabled();
         }
         if feature == Feature::Plugins {
+            self.sync_plugins_command_enabled();
             self.refresh_plugin_mentions();
         }
         if feature == Feature::PreventIdleSleep {
@@ -9181,6 +9242,11 @@ impl ChatWidget {
     fn sync_personality_command_enabled(&mut self) {
         self.bottom_pane
             .set_personality_command_enabled(self.config.features.enabled(Feature::Personality));
+    }
+
+    fn sync_plugins_command_enabled(&mut self) {
+        self.bottom_pane
+            .set_plugins_command_enabled(self.config.features.enabled(Feature::Plugins));
     }
 
     fn current_model_supports_personality(&self) -> bool {
@@ -9488,10 +9554,6 @@ impl ChatWidget {
     pub(crate) fn add_error_message(&mut self, message: String) {
         self.add_to_history(history_cell::new_error_event(message));
         self.request_redraw();
-    }
-
-    pub(crate) fn add_warning_message(&mut self, message: String) {
-        self.on_warning(message);
     }
 
     fn add_app_server_stub_message(&mut self, feature: &str) {
